@@ -1,0 +1,1415 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2021 SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Das U-Boot Installer Unit / Integration Tests
+#
+
+set -eu
+
+trap 'global_tear_down; trap - EXIT; exit' EXIT INT HUP
+
+
+global_tear_down() {
+    tear_down
+    rm .dubi.lib 2> /dev/null || :
+    echo "DONE!"
+}
+
+
+ok() {
+    printf "\033[32mOK\033[0m\n"
+}
+
+
+fail() {
+    printf "\033[31mFAIL\033[0m\n"
+    echo "  $1"
+    exit 1
+}
+
+
+assert_eq() {
+    [ "$1" = "$2" ] || fail "Expected:
+    \"$1\"
+  but get:
+    \"$2\""
+}
+
+assert_contains() {
+    echo "$2" | grep -q "$1" || fail "\"$1\" no present in \"$2\""
+}
+
+
+tear_down() {
+    rm -fr .dupath 2> /dev/null || :
+    rm .sdcard.img 2> /dev/null || :
+    rm .boot.bin 2> /dev/null || :
+    rm -fr .mount 2> /dev/null || :
+    rm -fr /tmp/dubi.* 2> /dev/null || :
+}
+
+
+test_log() {
+    line="$(log "some text" 2>&1)"
+    assert_eq "" "$line"
+
+    # shellcheck disable=SC2034
+    DEBUG=1
+    line="$(log "some text" 2>&1)"
+    assert_eq "DBG: some text" "$line"
+
+    ok
+}
+
+
+test_list_models_single() {
+    DUPATH=".dupath"
+    mkdir -p "$DUPATH"
+
+    # Empty directory
+    models="$(list_models)"
+    assert_eq "Installable models:" "$models"
+
+    # No description
+    # shellcheck disable=SC2153
+    touch "${DUPATH}/${DUFILE}"
+    models="$(list_models)"
+    assert_eq "Installable model:
+ - NO MODEL [NO CPU]: NO DESCRIPTION" "$models"
+
+    # With description
+    cat <<EOF > "${DUPATH}/${DUFILE}"
+MODEL="model"
+CPU="cpu"
+DESCRIPTION="description"
+EOF
+    models="$(list_models)"
+    assert_eq "Installable model:
+ - model [cpu]: description" "$models"
+
+    ok
+}
+
+
+test_list_models_multi() {
+    DUPATH=".dupath"
+    mkdir -p "$DUPATH/model1"
+    mkdir -p "$DUPATH/model2"
+
+    # Empty directory
+    models="$(list_models)"
+    assert_eq "Installable models:" "$models"
+
+    # No description
+    touch "${DUPATH}/model1/${DUFILE}"
+    touch "${DUPATH}/model2/${DUFILE}"
+    models="$(list_models)"
+    assert_eq "Installable models:
+ - model1 [NO CPU]: NO DESCRIPTION
+ - model2 [NO CPU]: NO DESCRIPTION" "$models"
+
+    # With description
+    cat <<EOF > "${DUPATH}/model1/${DUFILE}"
+MODEL="model1"
+CPU="cpu1"
+DESCRIPTION="description1"
+EOF
+    cat <<EOF > "${DUPATH}/model2/${DUFILE}"
+MODEL="model2"
+CPU="cpu2"
+DESCRIPTION="description2"
+EOF
+    models="$(list_models)"
+    assert_eq "Installable models:
+ - model1 [cpu1]: description1
+ - model2 [cpu2]: description2" "$models"
+
+    ok
+}
+
+
+test_check_requirements() {
+    die() { echo "$1"; }
+
+    # shellcheck disable=SC2034
+    _REQUIRES="cp nopresent"
+    result="$(check_requirements 2>&1)"
+    assert_contains "nopresent not found, install it or check the path" "$result"
+
+    ok
+}
+
+
+test_is_in() {
+    is_in "a" "a b c" || fail "Word \"a\" not found"
+    is_in "b" "a b c" || fail "Word \"b\" not found"
+    is_in "c" "a b c" || fail "Word \"c\" not found"
+    is_in "a" "b c" && fail "Word \"a\" found"
+    is_in "" "b c" && fail "Empty word \"\" found"
+    is_in "a" "aa bb cc" && fail "Substring \"a\" found"
+    is_in "b" "aa bb cc" && fail "Substring \"b\" found"
+    is_in "c" "aa bb cc" && fail "Substring \"c\" found"
+
+    ok
+}
+
+
+test_is_in_any() {
+    is_in_any "a" "a b c" || fail "Word \"a\" not found"
+    is_in_any "b" "a b c" || fail "Word \"b\" not found"
+    is_in_any "c" "a b c" || fail "Word \"c\" not found"
+    is_in_any "x" "b c" && fail "Word \"a\" found"
+    is_in_any "" "b c" && fail "Empty word \"\" found"
+    is_in_any "a" "aa bb cc" && fail "Substring \"a\" found"
+    is_in_any "b" "aa bb cc" && fail "Substring \"b\" found"
+    is_in_any "c" "aa bb cc" && fail "Substring \"c\" found"
+
+    is_in_any "a" "a b c" || fail "Word \"a\" not found"
+    is_in_any "a" "x" "a b c" || fail "Word \"a\" not found"
+    is_in_any "x" "a" "a b c" || fail "Word \"a\" not found"
+    is_in_any "x" "y" "a b c" && fail "Word \"x\" or \"y\" found"
+
+    ok
+}
+
+
+test_contains() {
+    contains "a" "a b c" || fail "Word \"a\" not found"
+    contains "b" "a b c" || fail "Word \"b\" not found"
+    contains "c" "a b c" || fail "Word \"c\" not found"
+    contains "a" "b c" && fail "Word \"a\" found"
+    contains "" "b c" && fail "Empty word \"\" found"
+    contains "a" "aa bb cc" || fail "Substring \"a\" not found"
+    contains "b" "aa bb cc" || fail "Substring \"b\" not found"
+    contains "c" "aa bb cc" || fail "Substring \"c\" noy found"
+
+    ok
+}
+
+
+test_contains_any() {
+    contains_any "a" "a b c" || fail "Word \"a\" not found"
+    contains_any "b" "a b c" || fail "Word \"b\" not found"
+    contains_any "c" "a b c" || fail "Word \"c\" not found"
+    contains_any "x" "b c" && fail "Word \"a\" found"
+    contains_any "" "b c" && fail "Empty word \"\" found"
+    contains_any "a" "aa bb cc" || fail "Substring \"a\" not found"
+    contains_any "b" "aa bb cc" || fail "Substring \"b\" not found"
+    contains_any "c" "aa bb cc" || fail "Substring \"c\" noy found"
+
+    contains_any "a" "a b c" || fail "Word \"a\" not found"
+    contains_any "a" "x" "a b c" || fail "Word \"a\" not found"
+    contains_any "x" "a" "a b c" || fail "Word \"a\" not found"
+    contains_any "a" "aa bb cc" || fail "Substring \"a\" not found"
+    contains_any "a" "x" "aa bb cc" || fail "Substring \"a\" not found"
+    contains_any "x" "a" "aa bb cc" || fail "Substring \"a\" not found"
+    contains_any "x" "y" "a b c" && fail "Word \"x\" or \"y\" found"
+
+    ok
+}
+
+
+test_get_line() {
+    text="1 one\n2 two\n3 three"
+    assert_eq "$(get_line "$text" 1)" "1 one"
+    assert_eq "$(get_line "$text" 2)" "2 two"
+    assert_eq "$(get_line "$text" 3)" "3 three"
+    assert_eq "$(get_line "$text" 4)" ""
+
+    ok
+}
+
+
+test_is_valid_unit() {
+    is_valid_unit "unit" && fail "\"unit\" is not a valid unit"
+    is_valid_unit "" && fail "\"\" is not a valid unit"
+    is_valid_unit "K" || fail "\"K\" is a valid unit"
+    is_valid_unit "k" || fail "\"k\" is a valid unit"
+    is_valid_unit "TiB" || fail "\"TiB\" is a valid unit"
+    is_valid_unit "tib" || fail "\"tib\" is a valid unit"
+    is_valid_unit "iB" && fail "\"iB\" is not a valid unit"
+
+    ok
+}
+
+
+test_is_valid_size() {
+    is_valid_size "" && fail "\"\" is not a valid size"
+    is_valid_size "ten" && fail "\"ten\" is not a valid size"
+    is_valid_size "K" && fail "\"K\" is not a valid size"
+    is_valid_size "10" && fail "\"10\" is not a valid size"
+    is_valid_size "10K" || fail "\"10K\" is a valid size"
+    is_valid_size "10k" || fail "\"10k\" is a valid size"
+    is_valid_size "10TiB" || fail "\"10TiB\" is a valid size"
+    is_valid_size "10tib" || fail "\"10tib\" is a valid size"
+    is_valid_size "10iB" && fail "\"10iB\" is not a valid size"
+
+    ok
+}
+
+
+test_is_parameter_with_size() {
+    is_parameter_with_size "param" && fail "Parameter without value"
+    is_parameter_with_size "param=" && fail "Parameter without value"
+    is_parameter_with_size "param=1" && fail "Parameter without unit"
+    is_parameter_with_size "param=1K" || fail "Parameter with unit"
+    is_parameter_with_size "param=1k" || fail "Parameter with unit"
+    is_parameter_with_size "param=1U" && fail "Parameter with invalid unit"
+    is_parameter_with_size "param=K" && fail "Parameter with invalid size"
+    is_parameter_with_size "param=ten" && fail "Parameter with invalid value"
+
+    ok
+}
+
+
+test_is_parameter_with_value() {
+    is_parameter_with_value "param" && fail "Parameter without value"
+    is_parameter_with_value "param=" && fail "Parameter without value"
+    is_parameter_with_value "param=1" || fail "Parameter with value"
+    is_parameter_with_value "param=1K" || fail "Parameter with value"
+    is_parameter_with_value "param=1U" || fail "Parameter with value"
+    is_parameter_with_value "param=K" || fail "Parameter with value"
+    is_parameter_with_value "param=ten" || fail "Parameter with value"
+
+    ok
+}
+
+
+test_is_valid_partition_parameter_size() {
+    for param in start size; do
+	is_valid_partition_parameter "$param" && fail "\"${param}\" requires a value"
+	is_valid_partition_parameter "${param}=" && fail "\"${param}\" missing a value"
+	is_valid_partition_parameter "${param}=1" && fail "\"${param}\" values requires a size"
+	is_valid_partition_parameter "${param}=1M" || fail "\"${param}\" has a valid size"
+	is_valid_partition_parameter "${param}=1U" && fail "\"${param}\" has invalid size"
+	is_valid_partition_parameter "${param}=M" && fail "\"${param}\" has invalid size"
+	is_valid_partition_parameter "${param}=ten" && fail "\"${param}\" has invalid size"
+    done
+
+    ok
+}
+
+
+test_is_valid_partition_parameter_value() {
+    for param in attrs uuid name type filesystem; do
+	is_valid_partition_parameter "$param" && fail "\"${param}\" requires a value"
+	is_valid_partition_parameter "${param}=" && fail "\"${param}\" missing a value"
+	is_valid_partition_parameter "${param}=1" || fail "\"${param}\" has a valid value"
+	is_valid_partition_parameter "${param}=1M" || fail "\"${param}\" has a valid value"
+	is_valid_partition_parameter "${param}=1U" || fail "\"${param}\" has a valid value"
+	is_valid_partition_parameter "${param}=M" || fail "\"${param}\" has a valid value"
+	is_valid_partition_parameter "${param}=ten" || fail "\"${param}\" has a valid value"
+    done
+    
+    ok
+}
+
+
+test_is_valid_partition_parameter_empty() {
+    is_valid_partition_parameter "bootable" || fail "\"bootable\" dont have a value"
+    is_valid_partition_parameter "bootable=" || fail "\"bootable\" dont have a value"
+    is_valid_partition_parameter "bootable=1" && fail "\"bootable\" dont have a value"
+    is_valid_partition_parameter "bootable=1M" && fail "\"bootable\" dont have a value"
+    is_valid_partition_parameter "bootable=1U" && fail "\"bootable\" dont have a value"
+    is_valid_partition_parameter "bootable=M" && fail "\"bootable\" dont have a value"
+    is_valid_partition_parameter "bootable=ten" && fail "\"bootable\" dont have a value"
+
+    ok
+}
+
+
+test_is_valid_partition_parameter_invalid() {
+    is_valid_partition_parameter "param" && fail "\"param\" is not a valid parameter"
+    is_valid_partition_parameter "param=" && fail "\"param\" is not a valid parameter"
+    is_valid_partition_parameter "param=1" && fail "\"param\" is not a valid parameter"
+    is_valid_partition_parameter "param=1M" && fail "\"param\" is not a valid parameter"
+    is_valid_partition_parameter "param=1U" && fail "\"param\" is not a valid parameter"
+    is_valid_partition_parameter "param=M" && fail "\"param\" is not a valid parameter"
+    is_valid_partition_parameter "param=ten" && fail "\"param\" is not a valid parameter"
+
+    ok
+}
+
+
+test_is_valid_dd_parameter_size() {
+    for param in seek skip dst src; do
+	is_valid_dd_parameter "$param" && fail "\"${param}\" requires a size"
+	is_valid_dd_parameter "${param}=" && fail "\"${param}\" missing a size"
+	is_valid_dd_parameter "${param}=1" && fail "\"${param}\" has invalid size"
+	is_valid_dd_parameter "${param}=1M" || fail "\"${param}\" has a valid size"
+	is_valid_dd_parameter "${param}=1U" && fail "\"${param}\" has invalid size"
+	is_valid_dd_parameter "${param}=M" && fail "\"${param}\" has invalid size"
+	is_valid_dd_parameter "${param}=ten" && fail "\"${param}\" has invalid size"
+    done
+
+    ok
+}
+
+
+test_is_valid_dd_parameter_value() {
+    is_valid_dd_parameter "partition" && fail "\"partition\" requires a value"
+    is_valid_dd_parameter "partition=" && fail "\"partition\" missing a value"
+    is_valid_dd_parameter "partition=1" || fail "\"partition\" has a valid value"
+    is_valid_dd_parameter "partition=1M" || fail "\"partition\" has a valid value"
+    is_valid_dd_parameter "partition=1U" || fail "\"partition\" has a valid value"
+    is_valid_dd_parameter "partition=M" || fail "\"partition\" has a valid value"
+    is_valid_dd_parameter "partition=ten" || fail "\"partition\" has a valid value"
+
+    is_valid_dd_parameter "param" && fail "\"param\" is not a valid parameter"
+
+    ok
+}
+
+
+test_is_valid_cp_parameter() {
+    for param in partition path name; do
+	is_valid_cp_parameter "$param" && fail "\"${param}\" requires a value"
+	is_valid_cp_parameter "${param}=" && fail "\"${param}\" missing a value"
+	is_valid_cp_parameter "${param}=1" || fail "\"${param}\" has a valid value"
+	is_valid_cp_parameter "${param}=1M" || fail "\"${param}\" has a valid value"
+	is_valid_cp_parameter "${param}=1U" || fail "\"${param}\" has a valid value"
+	is_valid_cp_parameter "${param}=M" || fail "\"${param}\" has a valid value"
+	is_valid_cp_parameter "${param}=ten" || fail "\"${param}\" has a valid value"
+    done
+
+    is_valid_cp_parameter "param" && fail "\"param\" is not a valid parameter"
+
+    ok
+}
+
+
+test_is_valid_bootloader_parameter_size() {
+    for param in seek skip dst src; do
+	is_valid_bootloader_parameter "$param" && fail "\"${param}\" requires a size"
+	is_valid_bootloader_parameter "${param}=" && fail "\"${param}\" missing a size"
+	is_valid_bootloader_parameter "${param}=1" && fail "\"${param}\" has invalid size"
+	is_valid_bootloader_parameter "${param}=1M" || fail "\"${param}\" has a valid size"
+	is_valid_bootloader_parameter "${param}=1U" && fail "\"${param}\" has invalid size"
+	is_valid_bootloader_parameter "${param}=M" && fail "\"${param}\" has invalid size"
+	is_valid_bootloader_parameter "${param}=ten" && fail "\"${param}\" has invalid size"
+    done
+
+    is_valid_bootloader_parameter "param" && fail "\"param\" is not a valid parameter"
+
+    ok
+}
+
+
+test_is_valid_bootloader_parameter_value() {
+    for param in partition path name; do
+	is_valid_bootloader_parameter "$param" && fail "\"${param}\" requires a value"
+	is_valid_bootloader_parameter "${param}=" && fail "\"${param}\" missing a value"
+	is_valid_bootloader_parameter "${param}=1" || fail "\"${param}\" has a valid value"
+	is_valid_bootloader_parameter "${param}=1M" || fail "\"${param}\" has a valid value"
+	is_valid_bootloader_parameter "${param}=1U" || fail "\"${param}\" has a valid value"
+	is_valid_bootloader_parameter "${param}=M" || fail "\"${param}\" has a valid value"
+	is_valid_bootloader_parameter "${param}=ten" || fail "\"${param}\" has a valid value"
+    done
+    
+    ok
+}
+
+
+test_is_valid_devicetree_parameter_size() {
+    for param in seek skip dst src; do
+	is_valid_devicetree_parameter "$param" && fail "\"${param}\" requires a size"
+	is_valid_devicetree_parameter "${param}=" && fail "\"${param}\" missing a size"
+	is_valid_devicetree_parameter "${param}=1" && fail "\"${param}\" has invalid size"
+	is_valid_devicetree_parameter "${param}=1M" || fail "\"${param}\" has a valid size"
+	is_valid_devicetree_parameter "${param}=1U" && fail "\"${param}\" has invalid size"
+	is_valid_devicetree_parameter "${param}=M" && fail "\"${param}\" has invalid size"
+	is_valid_devicetree_parameter "${param}=ten" && fail "\"${param}\" has invalid size"
+    done
+
+    is_valid_devicetree_parameter "param" && fail "\"param\" is not a valid parameter"
+
+    ok
+}
+
+
+test_is_valid_devicetree_parameter_value() {
+    for param in partition path name; do
+	is_valid_devicetree_parameter "$param" && fail "\"${param}\" requires a value"
+	is_valid_devicetree_parameter "${param}=" && fail "\"${param}\" missing a value"
+	is_valid_devicetree_parameter "${param}=1" || fail "\"${param}\" has a valid value"
+	is_valid_devicetree_parameter "${param}=1M" || fail "\"${param}\" has a valid value"
+	is_valid_devicetree_parameter "${param}=1U" || fail "\"${param}\" has a valid value"
+	is_valid_devicetree_parameter "${param}=M" || fail "\"${param}\" has a valid value"
+	is_valid_devicetree_parameter "${param}=ten" || fail "\"${param}\" has a valid value"
+    done
+    
+    ok
+}
+
+
+test_is_valid_bootscr_parameter_size() {
+    for param in seek skip dst src; do
+	is_valid_bootscr_parameter "$param" && fail "\"${param}\" requires a size"
+	is_valid_bootscr_parameter "${param}=" && fail "\"${param}\" missing a size"
+	is_valid_bootscr_parameter "${param}=1" && fail "\"${param}\" has invalid size"
+	is_valid_bootscr_parameter "${param}=1M" || fail "\"${param}\" has a valid size"
+	is_valid_bootscr_parameter "${param}=1U" && fail "\"${param}\" has invalid size"
+	is_valid_bootscr_parameter "${param}=M" && fail "\"${param}\" has invalid size"
+	is_valid_bootscr_parameter "${param}=ten" && fail "\"${param}\" has invalid size"
+    done
+
+    is_valid_bootscr_parameter "param" && fail "\"param\" is not a valid parameter"
+
+    ok
+}
+
+
+test_is_valid_bootscr_parameter_value() {
+    for param in partition path name; do
+	is_valid_bootscr_parameter "$param" && fail "\"${param}\" requires a value"
+	is_valid_bootscr_parameter "${param}=" && fail "\"${param}\" missing a value"
+	is_valid_bootscr_parameter "${param}=1" || fail "\"${param}\" has a valid value"
+	is_valid_bootscr_parameter "${param}=1M" || fail "\"${param}\" has a valid value"
+	is_valid_bootscr_parameter "${param}=1U" || fail "\"${param}\" has a valid value"
+	is_valid_bootscr_parameter "${param}=M" || fail "\"${param}\" has a valid value"
+	is_valid_bootscr_parameter "${param}=ten" || fail "\"${param}\" has a valid value"
+    done
+    
+    ok
+}
+
+
+test_is_partitioned() {
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 32M "$DEVICE"
+    is_partitioned && fail "$DEVICE should be empty and without format"
+    
+    echo "1M," | $SFDISK --quiet "$DEVICE"
+    is_partitioned || fail "$DEVICE should contain a partition"
+
+    ok
+}
+
+
+test_register_partition() {
+    die() { echo "$1"; }
+
+    PARTITION=""
+    register_partition size=1M filesystem=fat
+    assert_eq "size=1M filesystem=fat" "$PARTITION"
+
+    register_partition size=2M type=swat
+    assert_eq "size=1M filesystem=fat\nsize=2M type=swat" "$PARTITION"
+
+    out="$(register_partition)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "size=1M filesystem=fat\nsize=2M type=swat" "$PARTITION"
+
+    out="$(register_partition param=value)"
+    assert_eq "ERROR: \"param=value\". Partition parameter param=value not valid" "$out"
+    assert_eq "size=1M filesystem=fat\nsize=2M type=swat" "$PARTITION"
+
+    ok
+}
+
+
+test_register_bootloader() {
+    die() { echo "$1"; }
+
+    BOOTLOADER=""
+    register_bootloader boot.bin dst=8K
+    assert_eq "boot.bin dst=8K" "$BOOTLOADER"
+
+    register_bootloader boot2.bin dst=32K
+    assert_eq "boot.bin dst=8K\nboot2.bin dst=32K" "$BOOTLOADER"
+
+    out="$(register_bootloader)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "boot.bin dst=8K\nboot2.bin dst=32K" "$BOOTLOADER"
+
+    out="$(register_bootloader boot.bin)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "boot.bin dst=8K\nboot2.bin dst=32K" "$BOOTLOADER"
+
+    out="$(register_bootloader boot3.bin param=value)"
+    assert_eq "ERROR: \"boot3.bin param=value\". Bootloader parameter param=value not valid" "$out"
+    assert_eq "boot.bin dst=8K\nboot2.bin dst=32K" "$BOOTLOADER"
+
+    ok
+}
+
+
+test_register_devicetree() {
+    die() { echo "$1"; }
+
+    DEVICETREE=""
+    register_devicetree device.dtb dst=8K
+    assert_eq "device.dtb dst=8K" "$DEVICETREE"
+
+    register_devicetree device2.dtb dst=32K
+    assert_eq "device.dtb dst=8K\ndevice2.dtb dst=32K" "$DEVICETREE"
+
+    out="$(register_devicetree)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "device.dtb dst=8K\ndevice2.dtb dst=32K" "$DEVICETREE"
+
+    out="$(register_devicetree device3.dtb)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "device.dtb dst=8K\ndevice2.dtb dst=32K" "$DEVICETREE"
+
+    out="$(register_devicetree device3.dtb param=value)"
+    assert_eq "ERROR: \"device3.dtb param=value\". Devicetree parameter param=value not valid" "$out"
+    assert_eq "device.dtb dst=8K\ndevice2.dtb dst=32K" "$DEVICETREE"
+
+    ok
+}
+
+
+test_register_bootscr() {
+    die() { echo "$1"; }
+
+    BOOTSCR=""
+    register_bootscr boot.scr dst=8K
+    assert_eq "boot.scr dst=8K" "$BOOTSCR"
+
+    register_bootscr boot2.scr dst=32K
+    assert_eq "boot.scr dst=8K\nboot2.scr dst=32K" "$BOOTSCR"
+
+    out="$(register_bootscr)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "boot.scr dst=8K\nboot2.scr dst=32K" "$BOOTSCR"
+
+    out="$(register_bootscr boot3.scr)"
+    assert_eq "ERROR: Missing parameters" "$out"
+    assert_eq "boot.scr dst=8K\nboot2.scr dst=32K" "$BOOTSCR"
+
+    out="$(register_bootscr boot3.scr param=value)"
+    assert_eq "ERROR: \"boot3.scr param=value\". Bootscr parameter param=value not valid" "$out"
+    assert_eq "boot.scr dst=8K\nboot2.scr dst=32K" "$BOOTSCR"
+
+    ok
+}
+
+
+test_register_file() {
+    die() { echo "$1"; }
+
+    FILE=""
+    FILE_CNT=0
+    out="$(register_file file1.txt)"
+    assert_eq  "ERROR: Missing parameters" "$out"
+    assert_eq "" "$FILE"
+    assert_eq "0" "$FILE_CNT"
+
+    register_file file1.txt "
+bootscr \"double quote\"
+file content
+"
+    assert_eq "file1.txt" "$FILE"
+    assert_eq "
+bootscr \"double quote\"
+file content
+" "$FILE_1"
+    assert_eq "1" "$FILE_CNT"
+
+    ok
+}
+
+
+test_register() {
+    for asset in partition part; do
+	PARTITION=""
+	register "$asset" size=1M filesystem=fat
+	assert_eq "size=1M filesystem=fat" "$PARTITION"
+    done
+
+    for asset in bootloader bin; do
+	BOOTLOADER=""
+	register "$asset" boot.bin dst=8K
+	assert_eq "boot.bin dst=8K" "$BOOTLOADER"
+    done
+
+    for asset in devicetree dtb; do
+	DEVICETREE=""
+	register "$asset" device1.dtb dst=8K
+	assert_eq "device1.dtb dst=8K" "$DEVICETREE"
+    done
+
+    for asset in bootscr scr; do
+	BOOTSCR=""
+	register "$asset" boot1.scr dst=8K
+	assert_eq "boot1.scr dst=8K" "$BOOTSCR"
+    done
+
+    FILE=""
+    FILE_CNT=0
+    register file file.txt content
+    assert_eq "file.txt" "$FILE"
+    assert_eq "content" "$FILE_1"
+    assert_eq "1" "$FILE_CNT"
+
+    ok
+}
+
+
+test_default_partition_layout() {
+    EFI="n"
+    layout="$(default_partition_layout)"
+    assert_eq "label: dos\n\nsize=16MiB type=c\nsize=500MiB type=swap\ntype=linux" "$layout"
+
+    EFI="y"
+    layout="$(default_partition_layout)"
+    assert_eq "label: gpt\n\nsize=16MiB type=uefi name=\"p.UEFI\"\nsize=500MiB type=swap name=\"p.swap\"\ntype=linux name=\"p.lxroot\"" "$layout"
+
+    ok
+}
+
+
+test_user_partition_layout() {
+    LABEL="dos"
+    PARTITION=""
+    register partition size=1M filesystem=fat
+    register partition size=2M type=swap
+    register partition type=linux filesystem=ext2
+
+    layout="$(user_partition_layout)"
+    assert_eq "label: dos\n\nsize=1M\nsize=2M type=swap\ntype=linux" "$layout"
+
+    ok
+}
+
+
+test_dubi_partition_default_efi() {
+    EFI="y"
+    LABEL="gpt"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    dubi_partition
+
+    layout="$($SFDISK --list --quiet "$DEVICE")"
+    assert_eq "Device         Start     End Sectors  Size Type
+.sdcard.img1    2048   34815   32768   16M EFI System
+.sdcard.img2   34816 1058815 1024000  500M Linux swap
+.sdcard.img3 1058816 2097118 1038303  507M Linux filesystem" "$layout"
+
+    ok
+}
+
+
+test_dubi_partition_default_bios() {
+    EFI="n"
+    LABEL="dos"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    dubi_partition
+
+    layout="$($SFDISK --list --quiet "$DEVICE")"
+    assert_eq "Device       Boot   Start     End Sectors  Size Id Type
+.sdcard.img1         2048   34815   32768   16M  c W95 FAT32 (LBA)
+.sdcard.img2        34816 1058815 1024000  500M 82 Linux swap / Solaris
+.sdcard.img3      1058816 2097151 1038336  507M 83 Linux" "$layout"
+
+    ok
+}
+
+
+test_dubi_partition_user_efi() {
+    EFI="y"
+    LABEL="gpt"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    register partition size=16M type=uefi filesystem=fat
+    register partition size=256M type=swap
+    register partition type=linux filesystem=ext4
+    
+    dubi_partition
+
+    layout="$($SFDISK --list --quiet "$DEVICE")"
+    assert_eq "Device        Start     End Sectors  Size Type
+.sdcard.img1   2048   34815   32768   16M EFI System
+.sdcard.img2  34816  559103  524288  256M Linux swap
+.sdcard.img3 559104 2097118 1538015  751M Linux filesystem" "$layout"
+
+    ok
+}
+
+
+test_dubi_partition_user_dos() {
+    EFI="n"
+    LABEL="dos"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    register partition size=16M type=c filesystem=fat
+    register partition size=256M type=swap
+    register partition type=linux filesystem=ext4
+    
+    dubi_partition
+
+    layout="$($SFDISK --list --quiet "$DEVICE")"
+    assert_eq "Device       Boot  Start     End Sectors  Size Id Type
+.sdcard.img1        2048   34815   32768   16M  c W95 FAT32 (LBA)
+.sdcard.img2       34816  559103  524288  256M 82 Linux swap / Solaris
+.sdcard.img3      559104 2097151 1538048  751M 83 Linux" "$layout"
+
+    ok
+}
+
+
+test_is_device() {
+    is_device /dev/null || fail "/dev/null is a device"
+    is_device ".sdcard.img" && fail ".sdcard.img is not a device"
+
+    ok
+}
+
+
+test_format_device_swap() {
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    for filesystem in "Linux swap / Solaris" "Linux swap" "swap"; do
+	fallocate -l 32M "$DEVICE"
+	format_device "$DEVICE" "$filesystem"
+ 	assert_contains "Linux swap" "$(file "$DEVICE")"
+	rm "$DEVICE"
+    done
+
+    ok
+}
+
+
+test_format_device_default() {
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    # shellcheck disable=SC2034
+    FILESYSTEM="ext4"
+
+    for filesystem in "Linux" "Linux filesystem"; do
+	fallocate -l 32M "$DEVICE"
+	format_device "$DEVICE" "$filesystem"
+	assert_contains "ext4" "$(file "$DEVICE")"
+	rm "$DEVICE"
+    done
+
+    ok
+}
+
+
+test_format_device_fat() {
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    for filesystem in "W95 FAT32" "EFI System"; do
+	fallocate -l 32M "$DEVICE"
+	format_device "$DEVICE" "$filesystem"
+	assert_contains "DOS/MBR" "$(file "$DEVICE")"
+	rm "$DEVICE"
+    done
+
+    ok
+}
+
+
+test_format_device_btrfs() {
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+    format_device "$DEVICE" "btrfs"
+    assert_contains "BTRFS" "$(file "$DEVICE")"
+
+    ok
+}
+
+
+test_default_format_efi() {
+    EFI="y"
+    LABEL="gpt"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    dubi_partition
+
+    format_device() { echo "$1 $2"; }
+    out="$(default_format "$DEVICE")"
+    assert_eq ".sdcard.img1 EFI System
+.sdcard.img2 Linux swap
+.sdcard.img3 Linux filesystem" "$out"
+
+    ok
+}
+
+
+test_get_field() {
+    out="$(get_field "field" "field1=value1 field2=value2")"
+    assert_eq "" "$out"
+
+    out="$(get_field "field" "field=value field2=value2")"
+    assert_eq "value" "$out"
+
+    out="$(get_field "field" "field1=value1 field=value")"
+    assert_eq "value" "$out"
+
+    out="$(get_field "field" "field1=value1 field=/value")"
+    assert_eq "/value" "$out"
+
+    ok
+}
+
+
+test_get_filesystem() {
+    PARTITION=""
+    register partition size=16M type=c filesystem=fat
+    register partition size=256M type=swap
+    register partition type=linux filesystem=ext4
+
+    filesystem="$(get_filesystem 1 "none")"
+    assert_eq "fat" "$filesystem"
+
+    filesystem="$(get_filesystem 2 "none")"
+    assert_eq "none" "$filesystem"
+
+    filesystem="$(get_filesystem 3 "none")"
+    assert_eq "ext4" "$filesystem"
+
+    ok
+}
+
+
+test_user_format_dos() {
+    EFI="n"
+    LABEL="dos"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    register partition size=16M type=c filesystem=fat
+    register partition size=256M type=swap
+    register partition type=linux filesystem=ext4
+    dubi_partition
+
+    format_device() { echo "$1 $2"; }
+    out="$(user_format "$DEVICE")"
+    assert_eq ".sdcard.img1 fat
+.sdcard.img2 Linux swap / Solaris
+.sdcard.img3 ext4" "$out"
+
+    ok
+}
+
+
+test_user_format_efi() {
+    # shellcheck disable=SC2034
+    EFI="y"
+    # shellcheck disable=SC2034
+    LABEL="gpt"
+    DEVICE=".sdcard.img"
+    SFDISK="/usr/sbin/sfdisk"
+
+    fallocate -l 1G "$DEVICE"
+
+    PARTITION=""
+    register partition size=16M type=uefi filesystem=fat
+    register partition size=256M type=swap
+    register partition type=linux filesystem=ext4
+    dubi_partition
+
+    format_device() { echo "$1 $2"; }
+    out="$(user_format "$DEVICE")"
+    assert_eq ".sdcard.img1 fat
+.sdcard.img2 Linux swap
+.sdcard.img3 ext4" "$out"
+
+    ok
+}
+
+
+test_loopdev_attach() {
+    LOSETUP="losetup"
+    losetup() { echo "/dev/loop0"; }
+
+    DEVICE="/dev/null"
+    out="$(loopdev_attach)"
+    assert_eq "$DEVICE" "$out"
+
+    DEVICE=".sdcard.img"
+    out="$(loopdev_attach)"
+    assert_eq "/dev/loop0" "$out"
+
+    ok
+}
+
+
+test_loopdev_detach() {
+    # shellcheck disable=SC2034
+    LOSETUP="losetup"
+    losetup() { echo "detach"; }
+
+    DEVICE="/dev/null"
+    out="$(loopdev_detach "$DEVICE")"
+    assert_eq "" "$out"
+
+    DEVICE=".sdcard.img"
+    out="$(loopdev_detach /dev/null)"
+    assert_eq "detach" "$out"
+
+    ok
+}
+
+
+test_dev_mount_umount() {
+    # shellcheck disable=SC2034
+    MOUNT="mount"
+    mount() { :; }
+
+    # shellcheck disable=SC2034
+    UMOUNT="umount"
+    umount() { echo "umount"; }
+
+    out="$(dev_mount /dev/null)"
+    [ -d "$out" ] || fail "Temporary directory $out not present"
+
+    out_umount="$(dev_umount "$out")"
+    [ -d "$out" ] && fail "Temporary directory $out still present"
+    assert_eq "umount" "$out_umount"
+
+    ok
+}
+
+
+test_dubi_format() {
+    loopdev_attach() { echo "attach"; }
+    loopdev_detach() { echo "detach $1"; }
+    default_format() { echo "default $1"; }
+    user_format() { echo "user $1"; }
+
+    PARTITION=""
+    out="$(dubi_format)"
+    assert_eq "default attach
+detach attach" "$out"
+
+    PARTITION="some_layout"
+    out="$(dubi_format)"
+    assert_eq "user attach
+detach attach" "$out"
+
+    ok
+}
+
+
+test_get_method_bootloader() {
+    method="$(get_method_bootloader "boot.bin dst=8K path=/boot")"
+    assert_eq "Impossible to detect installation method" "$method"
+
+    method="$(get_method_bootloader "boot.bin path=/boot")"
+    assert_eq "Missing partition parameter" "$method"
+
+    method="$(get_method_bootloader "boot.bin name=boot")"
+    assert_eq "Missing path parameter" "$method"
+
+    method="$(get_method_bootloader "boot.bin seek=1K dst=1K")"
+    assert_eq "Using dst and seek together, one is an alias of another" "$method"
+
+    method="$(get_method_bootloader "boot.bin skip=1K src=1K")"
+    assert_eq "Using src and skip together, one is an alias of another" "$method"
+
+    method="$(get_method_bootloader "boot.bin dst=8K")"
+    assert_eq "dd" "$method"
+
+    method="$(get_method_bootloader "boot.bin dst=8K partition=1")"
+    assert_eq "dd" "$method"
+
+    method="$(get_method_bootloader "boot.bin partition=1 path=/EFI")"
+    assert_eq "cp" "$method"
+
+    method="$(get_method_bootloader "boot.bin")"
+    assert_eq "No installation method provided" "$method"
+
+    ok
+}
+
+
+test_get_asset_with_path() {
+    _DUFILE="/etc/dubi/model/dubi.dsc"
+
+    out="$(get_asset_with_path asset)"
+    assert_eq "/etc/dubi/model/asset" "$out"
+
+    out="$(get_asset_with_path boot/asset)"
+    assert_eq "/etc/dubi/model/boot/asset" "$out"
+
+    ok
+}
+
+
+test_get_asset_from_file() {
+    out="$(get_asset_from_file "file.txt")"
+    assert_eq "" "$out"
+
+    register file "file.txt" "content"
+    out="$(get_asset_from_file "file.txt")"
+    assert_contains "/tmp/dubi." "$out"
+    assert_contains "/file.txt" "$out"
+    [ -f "$out" ] || fail "Missing file $out"
+
+    out="$(cat "$out")"
+    assert_eq "content" "$out"
+
+    ok
+}
+
+
+test_clean_asset_from_file() {
+    register file "file.txt" "content"
+    out="$(get_asset_from_file "file.txt")"
+    [ -f "$out" ] || fail "Missing file $out"
+
+    clean_asset_from_file "$out"
+    [ -f "$out" ] && fail "Still present $out"
+
+    ok
+}
+
+
+test_get_asset_only_path() {
+    _DUFILE="$(pwd)/dubi.dsc"
+    touch ".boot.bin"
+    FILE=""
+    FILE_CNT=0
+
+    out="$(get_asset .boot.bin)"
+    assert_eq "$(pwd)/.boot.bin" "$out"
+
+    ok
+}
+
+
+test_get_asset_only_file() {
+    _DUFILE="$(pwd)/dubi.dsc"
+    FILE=""
+    FILE_CNT=0
+    register file ".boot.bin" "content"
+
+    out="$(get_asset .boot.bin)"
+    assert_contains "/tmp/dubi." "$out"
+    assert_contains "/.boot.bin" "$out"
+
+    ok
+}
+
+
+test_get_asset_path_and_file() {
+    _DUFILE="$(pwd)/dubi.dsc"
+    touch ".boot.bin"
+    FILE=""
+    FILE_CNT=0
+    register file ".boot.bin" "content"
+
+    out="$(get_asset .boot.bin)"
+    assert_eq "$(pwd)/.boot.bin" "$out"
+
+    ok
+}
+
+
+test_get_device_partition() {
+    out="$(get_device_partition /dev/sda 1)"
+    assert_eq "/dev/sda1" "$out"
+
+    out="$(get_device_partition /dev/vda 1)"
+    assert_eq "/dev/vda1" "$out"
+
+    out="$(get_device_partition /dev/hda 1)"
+    assert_eq "/dev/hda1" "$out"
+
+    out="$(get_device_partition /dev/nvme0n1 1)"
+    assert_eq "/dev/nvme0n1p1" "$out"
+
+    out="$(get_device_partition /dev/mmcblk0 1)"
+    assert_eq "/dev/mmcblk0p1" "$out"
+
+    out="$(get_device_partition /dev/loop0 1)"
+    assert_eq "/dev/loop0p1" "$out"
+
+    ok
+}
+
+
+test__dd() {
+    dd() { echo "$@"; }
+
+    out="$(_dd if=if of=of)"
+    assert_eq "if=if of=of bs=4k" "$out"
+
+    ok
+}
+
+
+test_dd_asset_no_partition() {
+    DEVICE="/dev/null"
+
+    _DUFILE="$(pwd)/dubi.dsc"
+    touch ".boot.bin"
+
+    DD="ddcmd"
+    ddcmd() { echo "$@"; }
+
+    out="$(dd_asset .boot.bin dst=1K src=1K)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/null seek=1K skip=1K bs=4k" "$out"
+
+    out="$(dd_asset .boot.bin seek=1K src=1K)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/null seek=1K skip=1K bs=4k" "$out"
+
+    out="$(dd_asset .boot.bin dst=1K skip=1K)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/null seek=1K skip=1K bs=4k" "$out"
+
+    out="$(dd_asset .boot.bin seek=1K skip=1K)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/null seek=1K skip=1K bs=4k" "$out"
+
+    ok
+}
+
+
+test_dd_asset_partition() {
+    DEVICE="/dev/loop0"
+    loopdev_attach() { echo "$DEVICE"; }
+    loopdev_detach() { echo "detach $1"; }
+
+    _DUFILE="$(pwd)/dubi.dsc"
+    touch ".boot.bin"
+
+    # shellcheck disable=SC2034
+    DD="ddcmd"
+    ddcmd() { echo "$@"; }
+
+    out="$(dd_asset .boot.bin partition=1 dst=1K src=1K)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/loop0p1  seek=1K skip=1K bs=4k
+detach /dev/loop0" "$out"
+
+    out="$(dd_asset .boot.bin seek=1K partition=1 src=1K)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/loop0p1 seek=1K skip=1K bs=4k
+detach /dev/loop0" "$out"
+
+    out="$(dd_asset .boot.bin dst=1K skip=1K partition=1)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/loop0p1 seek=1K skip=1K bs=4k
+detach /dev/loop0" "$out"
+
+    out="$(dd_asset .boot.bin seek=1K skip=1K partition=1)"
+    assert_eq "if=$(pwd)/.boot.bin of=/dev/loop0p1 seek=1K skip=1K bs=4k
+detach /dev/loop0" "$out"
+
+    ok
+}
+
+
+test_cp_asset_no_rename() {
+    DEVICE="/dev/loop0"
+    loopdev_attach() { echo "$DEVICE"; }
+    loopdev_detach() { echo "detach $1"; }
+
+    dev_mount() { echo ".mount"; }
+    dev_umount() { echo "umount"; }
+
+    # shellcheck disable=SC2034
+    _DUFILE="$(pwd)/dubi.dsc"
+    touch ".boot.bin"
+
+    out="$(cp_asset .boot.bin partition=1 path=/efi)"
+    assert_eq "umount
+detach /dev/loop0" "$out"
+    [ -d ".mount" ] || fail ".mount directory missing"
+    [ -d ".mount/efi" ] || fail ".mount/efi directory missing"
+    [ -f ".mount/efi/.boot.bin" ] || fail ".mount/efi/.boot.bin file missing"
+
+    ok
+}
+
+
+test_cp_asset_rename() {
+    DEVICE="/dev/loop0"
+    loopdev_attach() { echo "$DEVICE"; }
+    loopdev_detach() { echo "detach $1"; }
+
+    dev_mount() { echo ".mount"; }
+    dev_umount() { echo "umount"; }
+
+    # shellcheck disable=SC2034
+    _DUFILE="$(pwd)/dubi.dsc"
+    touch ".boot.bin"
+
+    out="$(cp_asset .boot.bin partition=1 path=/efi name=boot.bin)"
+    assert_eq "umount
+detach /dev/loop0" "$out"
+    [ -d ".mount" ] || fail ".mount directory missing"
+    [ -d ".mount/efi" ] || fail ".mount/efi directory missing"
+    [ -f ".mount/efi/boot.bin" ] || fail ".mount/efi/boot.bin file missing"
+
+    ok
+}
+
+
+test_dubi_bootloader() {
+    dd_asset() { echo "dd $*"; }
+    cp_asset() { echo "cp $*"; }
+
+    BOOTLOADER=""
+    register bootloader boot.bin dst=8K
+    out="$(dubi_bootloader)"
+    assert_eq "dd boot.bin dst=8K" "$out"
+
+    BOOTLOADER=""
+    register bootloader boot.bin partition=1 path=/efi
+    out="$(dubi_bootloader)"
+    assert_eq "cp boot.bin partition=1 path=/efi" "$out"
+
+    BOOTLOADER=""
+    register bootloader boot.bin dst=8K partition=1 path=/efi
+    out="$(dubi_bootloader)"
+    assert_eq "Booloader line \"boot.bin dst=8K partition=1 path=/efi\" cannot be installed: Impossible to detect installation method" "$out"
+
+    ok
+}
+
+
+test_get_method_devicetree() {
+    method="$(get_method_devicetree "device.dtb dst=8K path=/boot")"
+    assert_eq "Impossible to detect installation method" "$method"
+
+    method="$(get_method_devicetree "device.dtb path=/boot")"
+    assert_eq "Missing partition parameter" "$method"
+
+    method="$(get_method_devicetree "device.dtb name=boot")"
+    assert_eq "Missing path parameter" "$method"
+
+    method="$(get_method_devicetree "device.dtb seek=1K dst=1K")"
+    assert_eq "Using dst and seek together, one is an alias of another" "$method"
+
+    method="$(get_method_devicetree "device.dtb skip=1K src=1K")"
+    assert_eq "Using src and skip together, one is an alias of another" "$method"
+
+    method="$(get_method_devicetree "device.dtb dst=8K")"
+    assert_eq "dd" "$method"
+
+    method="$(get_method_devicetree "device.dtb dst=8K partition=1")"
+    assert_eq "dd" "$method"
+
+    method="$(get_method_devicetree "device.dtb partition=1 path=/EFI")"
+    assert_eq "cp" "$method"
+
+    method="$(get_method_devicetree "boot.bin")"
+    assert_eq "No installation method provided" "$method"
+
+    ok
+}
+
+
+test_dubi_devicetree() {
+    dd_asset() { echo "dd $*"; }
+    cp_asset() { echo "cp $*"; }
+
+    DEVICETREE=""
+    register devicetree device.dtb dst=8K
+    out="$(dubi_devicetree)"
+    assert_eq "dd device.dtb dst=8K" "$out"
+
+    DEVICETREE=""
+    register devicetree device.dtb partition=1 path=/efi
+    out="$(dubi_devicetree)"
+    assert_eq "cp device.dtb partition=1 path=/efi" "$out"
+
+    DEVICETREE=""
+    register devicetree device.dtb dst=8K partition=1 path=/efi
+    out="$(dubi_devicetree)"
+    assert_eq "Devicetree line \"device.dtb dst=8K partition=1 path=/efi\" cannot be installed: Impossible to detect installation method" "$out"
+
+    ok
+}
+
+
+test_get_method_bootscr() {
+    method="$(get_method_bootscr "boot.scr dst=8K path=/boot")"
+    assert_eq "Impossible to detect installation method" "$method"
+
+    method="$(get_method_bootscr "boot.scr path=/boot")"
+    assert_eq "Missing partition parameter" "$method"
+
+    method="$(get_method_bootscr "boot.scr name=boot")"
+    assert_eq "Missing path parameter" "$method"
+
+    method="$(get_method_bootscr "boot.scr seek=1K dst=1K")"
+    assert_eq "Using dst and seek together, one is an alias of another" "$method"
+
+    method="$(get_method_bootscr "boot.scr skip=1K src=1K")"
+    assert_eq "Using src and skip together, one is an alias of another" "$method"
+
+    method="$(get_method_bootscr "boot.scr dst=8K")"
+    assert_eq "dd" "$method"
+
+    method="$(get_method_bootscr "boot.scr dst=8K partition=1")"
+    assert_eq "dd" "$method"
+
+    method="$(get_method_bootscr "boot.scr partition=1 path=/EFI")"
+    assert_eq "cp" "$method"
+
+    method="$(get_method_bootscr "boot.bin")"
+    assert_eq "No installation method provided" "$method"
+
+    ok
+}
+
+
+test_dubi_bootscr() {
+    dd_asset() { echo "dd $*"; }
+    cp_asset() { echo "cp $*"; }
+
+    BOOTSCR=""
+    register bootscr boot.scr dst=8K
+    out="$(dubi_bootscr)"
+    assert_eq "dd boot.scr dst=8K" "$out"
+
+    BOOTSCR=""
+    register bootscr boot.scr partition=1 path=/efi
+    out="$(dubi_bootscr)"
+    assert_eq "cp boot.scr partition=1 path=/efi" "$out"
+
+    BOOTSCR=""
+    register bootscr boot.scr dst=8K partition=1 path=/efi
+    out="$(dubi_bootscr)"
+    assert_eq "Bootscr line \"boot.scr dst=8K partition=1 path=/efi\" cannot be installed: Impossible to detect installation method" "$out"
+
+    ok
+}
+
+
+# Prepare `dubi` to be loaded as a library
+sed '/# -- MAIN code/,$d' dubi > .dubi.lib
+
+tests="${*-$(grep "^test_.*(" "$0" | cut -d"(" -f1)}"
+for t in $tests; do
+    printf "%-40s\t... " "$t"
+    # shellcheck disable=SC1091
+    . ./.dubi.lib
+    defaults
+    "$t"
+    tear_down
+done

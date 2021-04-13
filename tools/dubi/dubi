@@ -1,0 +1,955 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2021 SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Das U-Boot Installer
+#
+
+set -eu
+
+export PATH="$PATH:/sbin:/usr/sbin"
+
+# Read configuration and apply defaults
+for cfg in /usr/etc/dubi.cfg /etc/dubi.cfg ~/.config/dubi.cfg; do
+    # shellcheck disable=SC1090
+    [ -f "$cfg" ] && . "$cfg"
+done
+DUPATH="${DUPATH:-/usr/share/u-boot}"
+DUFILE="${DUFILE:-dubi.dsc}"
+
+# Device file, where to install u-boot
+DEVICE=
+# Model name, can come from the dsc file
+MODEL=
+# Partition and format the device
+FORMAT=0
+# Backup the partition layout information
+BACKUP=0
+# Wipe all partition information
+WIPE=0
+# Print some debug information
+DEBUG=0
+
+# Current values for DUFILE, as can contain or not the model name
+_DUFILE=""
+
+_TRUE_VALUES="yes true y t 1"
+
+_REQUIRES="sfdisk dd cp losetup mkswap mount umount"
+
+
+log() {
+    [ "$DEBUG" -eq 1 ] && echo "DBG: $1" 1>&2
+    :
+}
+
+
+die() {
+    echo "$1" 1>&2
+    exit 1
+}
+
+
+defaults() {
+    # Reset the information than comes from a dsc file.  Only MODEL
+    # can also come from the cli
+    MODEL=
+    CPU=
+    DESCRIPTION=
+    # TODO is EFI doing something more that setting the LABEL?
+    is_in "${EFI-}" "$_TRUE_VALUES" && [ -z "${LABEL-}" ] && LABEL="gpt"
+    EFI="${EFI:-n}"
+    LABEL="${LABEL:-dos}"
+    # List (lines separated by '\n') of assets to be `dd` into the
+    # device
+    BOOTLOADER=
+    # List of device trees that will be installed
+    DEVICETREE=
+    # List of boot.scr files
+    BOOTSCR=
+    # Comma separated string, with the names of file names. For each
+    # element in the list, a new variable FILE_X (where X =
+    # 1..FILE_CNT) will be present, with the content
+    FILE=
+    FILE_CNT=0
+    # List of expected partitions
+    PARTITION=
+    # Default filesystem
+    FILESYSTEM="${FILESYSTEM:-ext4}"
+
+    init() { :; }
+    partition() { dubi_partition; }
+    format() { dubi_format; }
+    bootloader() { dubi_bootloader; }
+    devicetree() { dubi_devicetree; }
+    bootscr() { dubi_bootscr; }
+}
+
+
+usage() {
+    # shellcheck disable=SC2039
+    local mode="$1"
+    if [ -n "$mode" ]; then
+	if [ "$mode" = "long" ]; then
+	    cat <<EOF 1>&2
+Das U-Boot installer script (dubi) is used to install u-boot in a SD
+card (or any other medium), following the rules described in a
+configuration file. Check the documentation for more information.
+EOF
+	else
+	    echo "$(basename "$0")": ERROR: "$@" 1>&2
+	fi
+	echo 1>&2
+    fi
+    cat <<EOF 1>&2
+usage: $(basename "$0") [-h] DEV
+
+Das U-Boot installer script.
+
+positional arguments
+ DEV         device to install (e.g. /dev/sdc)
+
+optional arguments:
+ -h, --help      show this help message and exit
+ -l, --list      list installable models
+ -m, --model MOD install model in MOD
+ -f, --format    if required, format / partition the device DEV
+ -b, --backup    backup the partition information of device DEV
+ -w, --wipe      wipe the partition information of device DEV
+ --dupath DIR    directory for models [/usr/share/u-boot]
+ --dufile FILE   name for installation file [dubi.dsc]
+ -d, --debug     show DEBUG information
+EOF
+
+    exit 1
+}
+
+
+list_models() {
+    # We can have multiple models, each one in a directory with a
+    # $DUFILE, or we can have a single model inside the $DUPATH
+    if [ -f "${DUPATH}/${DUFILE}" ]; then
+	log "Single model in ${DUPATH}"
+	echo "Installable model:"
+	_DUFILE="${DUPATH}/${DUFILE}"
+	# shellcheck disable=SC1090
+	. "${_DUFILE}"
+	init
+	echo " - ${MODEL:-NO MODEL} [${CPU:-NO CPU}]: ${DESCRIPTION:-NO DESCRIPTION}"
+	defaults
+    else
+	log "Multiple models in ${DUPATH}"
+	echo "Installable models:"
+	for model in "$DUPATH"/*/; do
+	    MODEL="$(basename "$model")"
+	    if [ -f "${model}/${DUFILE}" ]; then
+		_DUFILE="${DUPATH}/${MODEL}/${DUFILE}"
+		# shellcheck disable=SC1090
+		. "${_DUFILE}"
+	    else
+		continue
+	    fi
+	    init
+	    echo " - ${MODEL:-$(basename "$model")} [${CPU:-NO CPU}]: ${DESCRIPTION:-NO DESCRIPTION}"
+	    defaults
+	done
+    fi
+}
+
+
+check_requirements() {
+    log "Checking dependencies"
+    for prog in $_REQUIRES; do
+	command -v "$prog" >/dev/null || die "$prog not found, install it or check the path"
+    done
+
+    # TODO: use kpartx if we are using an old `losetup`
+    losetup --help | grep -q -- "--partscan" || die "$LOSETUP do not support --partscan"
+}
+
+
+# Check if $1 is in the list $2, example `is_in "a1" "a1 a2 a3"`
+is_in() {
+    [ -z "$1" ] && return 1
+    case "$2" in
+	"$1 "* | *" $1 "* | *" $1")
+ 	    return 0
+	    ;;
+	*)
+	    return 1
+	    ;;
+    esac
+}
+
+
+is_in_any() {
+    for last in "$@"; do :; done
+    for param in "$@"; do
+	[ "$param" = "$last" ] && return 1
+	is_in "$param" "$last" && return 0
+    done
+
+    return 1
+}
+
+
+contains() {
+    [ -z "$1" ] && return 1
+    case "$2" in
+	*"$1"*)
+ 	    return 0
+	    ;;
+	*)
+	    return 1
+	    ;;
+    esac
+}
+
+
+contains_any() {
+    for last in "$@"; do :; done
+    for param in "$@"; do
+	[ "$param" = "$last" ] && return 1
+	contains "$param" "$last" && return 0
+    done
+
+    return 1
+}
+
+
+# Get the line number $2 (counting from 1) from $1 text
+get_line() {
+    printf "%b\n" "$1" | sed "$2q;d"
+}
+
+
+is_valid_unit() {
+    units="K KiB M MiB G GiB T TiB P PiB E EiB Z ZiB Y YiB"
+    units_lower="$(echo "$units" | tr '[:upper:]' '[:lower:]')"
+    is_in "$1" "$units $units_lower"
+    return $?
+}
+
+
+is_valid_size() {
+    index=$(($(expr "$1" : '[0-9]*') + 1))
+    [ "$index" -eq 1 ] && return 1
+    unit=$(echo "$1" | cut -b"$index"-)
+    is_valid_unit "$unit"
+    return $?
+}
+
+
+is_parameter_with_size() {
+    value="${1#*=}"
+    is_valid_size "$value"
+    return $?
+}
+
+
+is_parameter_with_value() {
+    value="${1#*=}"
+    [ -z "$value" ] || [ "$value" = "$1" ] || return 0
+    return 1
+}
+
+
+is_valid_partition_parameter() {
+    parameter="${1%=*}"
+
+    # Parameters with units
+    sfdisk_parameters="start size"
+    is_in "$parameter" "${sfdisk_parameters}" && {
+	is_parameter_with_size "$1"
+	return $?
+    }
+
+    # Parameters without units
+    parameters="filesystem"
+    sfdisk_parameters="attrs uuid name type"
+    is_in "$parameter" "${parameters} ${sfdisk_parameters}" && {
+	is_parameter_with_value "$1"
+	return $?
+    }
+
+    # Parameters without values
+    sfdisk_parameters="bootable "
+    is_in "$parameter" "${sfdisk_parameters}" && {
+	is_parameter_with_value "$1" || return 0
+    }
+
+    return 1
+}
+
+
+is_valid_dd_parameter() {
+    parameter="${1%=*}"
+
+    # Parameters with units
+    parameters="dst src"
+    dd_parameters="seek skip"
+    is_in "$parameter" "${parameters} ${dd_parameters}" && {
+	is_parameter_with_size "$1"
+	return $?
+    }
+
+    # Parameters without units
+    parameters="partition "
+    is_in "$parameter" "${parameters}" && {
+	is_parameter_with_value "$1"
+	return $?
+    }
+
+    return 1
+}
+
+
+is_valid_cp_parameter() {
+    parameter="${1%=*}"
+
+    # Parameters without units
+    parameters="partition path name"
+    is_in "$parameter" "${parameters}" && {
+	is_parameter_with_value "$1"
+	return $?
+    }
+
+    return 1
+}
+
+
+is_valid_asset_parameter() {
+    (is_valid_dd_parameter "$1" || is_valid_cp_parameter "$1"); return $?
+}
+
+
+is_valid_bootloader_parameter() {
+    is_valid_asset_parameter "$1"; return $?
+}
+
+
+is_valid_devicetree_parameter() {
+    is_valid_asset_parameter "$1"; return $?
+}
+
+
+is_valid_bootscr_parameter() {
+    is_valid_asset_parameter "$1"; return $?
+}
+
+
+is_partitioned() {
+    sfdisk --list "$DEVICE" | grep -q "Disklabel type"
+}
+
+
+register_partition() {
+    log "Registering partition: $*"
+    [ "$#" -eq 0 ] && die "ERROR: Missing parameters"
+    for field in "$@"; do
+	is_valid_partition_parameter "$field" || die "ERROR: \"${*}\". Partition parameter $field not valid"
+    done
+    [ -n "$PARTITION" ] && PARTITION="$PARTITION\n"
+    PARTITION="${PARTITION}$*"
+}
+
+
+register_bootloader() {
+    log "Registering bootloader: $*"
+    [ "$#" -le 1 ] && die "ERROR: Missing parameters"
+    index=-1
+    for field in "$@"; do
+	index=$((index + 1))
+	# First parameter is the bootloader binary filename
+	[ "$index" -eq 0 ] && continue
+	is_valid_bootloader_parameter "$field" || die "ERROR: \"${*}\". Bootloader parameter $field not valid"
+    done
+    [ -n "$BOOTLOADER" ] && BOOTLOADER="$BOOTLOADER\n"
+    BOOTLOADER="${BOOTLOADER}$*"
+}
+
+
+register_devicetree() {
+    log "Registering devicetree: $*"
+    [ "$#" -le 1 ] && die "ERROR: Missing parameters"
+    index=-1
+    for field in "$@"; do
+	index=$((index + 1))
+	# First parameter is the device tree binary filename
+	[ "$index" -eq 0 ] && continue
+	is_valid_devicetree_parameter "$field" || die "ERROR: \"${*}\". Devicetree parameter $field not valid"
+    done
+    [ -n "$DEVICETREE" ] && DEVICETREE="$DEVICETREE\n"
+    DEVICETREE="${DEVICETREE}$*"
+}
+
+
+register_bootscr() {
+    log "Registering bootscr: $*"
+    [ "$#" -le 1 ] && die "ERROR: Missing parameters"
+    index=-1
+    for field in "$@"; do
+	index=$((index + 1))
+	# First parameter is the device tree binary filename
+	[ "$index" -eq 0 ] && continue
+	is_valid_bootscr_parameter "$field" || die "ERROR: \"${*}\". Bootscr parameter $field not valid"
+    done
+    [ -n "$BOOTSCR" ] && BOOTSCR="$BOOTSCR\n"
+    BOOTSCR="${BOOTSCR}$*"
+}
+
+
+register_file() {
+    log "Registering a file: $*"
+    [ "$#" -ne 2 ] && die "ERROR: Missing parameters"
+    [ -n "$FILE" ] && FILE="$FILE\n"
+    FILE="${FILE}$1"
+    FILE_CNT=$((FILE_CNT + 1))
+    eval "FILE_${FILE_CNT}='""${2:-}""'"
+}
+
+
+register() {
+    case "$1" in
+	"partition" | "part")
+	    shift
+	    register_partition "$@"
+	    ;;
+	"bootloader" | "bin")
+	    shift
+	    register_bootloader "$@"
+	    ;;
+	"devicetree" | "dtb")
+	    shift
+	    register_devicetree "$@"
+	    ;;
+	"bootscr" | "scr")
+	    shift
+	    register_bootscr "$@"
+	    ;;
+	"file")
+	    shift
+	    register_file "$@"
+	    ;;
+	*)
+	    die "Asset type $1 not recognized. Valid ones are 'partition', 'bootloader', 'devicetree', 'bootscr' or 'file'"
+	    ;;
+    esac
+}
+
+
+default_partition_layout() {
+    is_in "$EFI" "$_TRUE_VALUES" && [ "$LABEL" = "dos" ] && log "Ignoring LABEL value for a default partition"
+
+    if is_in "$EFI" "$_TRUE_VALUES"; then
+	log "Proposing default UEFI partition"
+	layout="label: gpt\n"
+	layout="${layout}\nsize=16MiB type=uefi name=\"p.UEFI\""
+	layout="${layout}\nsize=500MiB type=swap name=\"p.swap\""
+	layout="${layout}\ntype=linux name=\"p.lxroot\""
+    else
+	log "Proposing default non-UEFI partition"
+	layout="label: dos\n"
+	layout="${layout}\nsize=16MiB type=c"
+	layout="${layout}\nsize=500MiB type=swap"
+	layout="${layout}\ntype=linux"
+    fi
+
+    echo "$layout"
+}
+
+
+user_partition_layout() {
+    layout="label: ${LABEL}\n\n"
+    partitions="$(echo "$PARTITION" | sed "s/\s*filesystem=\w\+//g")"
+    echo "${layout}${partitions}"
+}
+
+
+dubi_partition() {
+    log "Default partitioner function"
+
+    if [ -z "$PARTITION" ]; then
+	layout=$(default_partition_layout)
+    else
+	layout=$(user_partition_layout)
+    fi
+    layout=$(printf '%b\n' "$layout")
+
+    log "Partition: $layout"
+
+    echo "$layout" | sfdisk --wipe always --quiet "$DEVICE"
+}
+
+
+is_device() {
+    case "$1" in
+	"/dev/"*)
+	    return 0
+	    ;;
+	*)
+	    return 1
+	    ;;
+    esac
+}
+
+
+_mkfs() {
+    case "$2" in
+	"swap")
+	    mkswap "$1" >/dev/null 2>&1
+	    ;;
+	"ext2" | "ext3" | "ext4")
+	    mkfs."$2" -q -F "$1" >/dev/null
+	    ;;
+	"btrfs")
+	    mkfs."$2" --quiet --force "$1" >/dev/null
+	    ;;
+	"fat" | "vfat")
+	    mkfs.vfat "$1" >/dev/null
+	    ;;
+	*)
+	    if [ -x mkfs."${2}" ]; then
+		mkfs."${2}" "$1" >/dev/null
+	    else
+		log "$1: $type not recognized, leaving without format"
+	    fi
+    esac
+}
+
+
+# Format a device or partition ($1) based on the type ($2)
+format_device() {
+    case "$2" in
+	"Linux swap"* | "swap")
+	    _mkfs "$1" "swap"
+	    ;;
+	"Linux" | "Linux filesystem")
+	    _mkfs "$1" "$FILESYSTEM"
+	    ;;
+	"W95 FAT32"* | "EFI System")
+	    _mkfs "$1" "vfat"
+	    ;;
+	*)
+	    _mkfs "$1" "$2"
+	    ;;
+    esac
+}
+
+
+default_format() {
+    sfdisk --list --output "Device,Type" --quiet "$1" | grep --invert-match "Device" | while read -r line; do
+	device=$(echo "$line" | cut -d" " -f1)
+	type=$(echo "$line" | cut -d" " -f2-)
+	format_device "$device" "$type"
+    done
+}
+
+
+get_field() {
+    field="$(echo "$2" | sed "s/.*$1=\([^ ]\+\).*/\1/")"
+    [ "$2" = "$field" ] && field=""
+    echo "$field"
+}
+
+
+# Get the filesystem from the line $1, or default $2 value
+get_filesystem() {
+    line="$(get_line "$PARTITION" "$1")"
+    filesystem="$(get_field "filesystem" "$line")"
+    [ -z "$filesystem" ] && filesystem="$2"
+    echo "$filesystem"
+}
+
+
+user_format() {
+    index=0
+    "$SFDISK" --list --output "Device,Type" --quiet "$1" | grep --invert-match "Device" | while read -r line; do
+	device=$(echo "$line" | cut -d" " -f1)
+	type=$(echo "$line" | cut -d" " -f2-)
+
+	index=$((index + 1))
+	filesystem=$(get_filesystem "$index" "$type")
+
+	format_device "$device" "$filesystem"
+    done
+}
+
+
+loopdev_attach() {
+    if is_device "$DEVICE"; then
+	echo "$DEVICE"
+    else
+	losetup --show --partscan -f "$DEVICE"
+    fi
+}
+
+
+loopdev_detach() {
+    is_device "$DEVICE" || losetup --detach "$1"
+}
+
+
+dev_mount() {
+    tmp_dir="$(mktemp --directory --quiet -t dubi.XXXXXXXXXX)"
+    "$MOUNT" "$1" "$tmp_dir"
+    echo "$tmp_dir"
+}
+
+
+dev_umount() {
+    sync
+    "$UMOUNT" "$1"
+    rmdir "$1" || :
+}
+
+
+dubi_format() {
+    log "Default format function"
+
+    loopdev="$(loopdev_attach)"
+    if [ -z "$PARTITION" ]; then
+	default_format "$loopdev"
+    else
+	user_format "$loopdev"
+    fi
+    loopdev_detach "$loopdev"
+}
+
+
+get_method_bootloader() {
+    if contains "path=" "$1" && contains_any "seek=" "skip=" "dst=" "src=" "$1"; then
+	echo "Impossible to detect installation method"
+    elif contains "path=" "$1" && ! contains "partition=" "$1"; then
+	echo "Missing partition parameter"
+    elif contains "name=" "$1" && ! contains "path=" "$1"; then
+	echo "Missing path parameter"
+    elif contains "seek=" "$1" && contains "dst=" "$1"; then
+	echo "Using dst and seek together, one is an alias of another"
+    elif contains "skip=" "$1" && contains "src=" "$1"; then
+	echo "Using src and skip together, one is an alias of another"
+    elif contains_any "seek=" "skip=" "dst=" "src=" "$1"; then
+	echo "dd"
+    elif contains "path=" "$1"; then
+	echo "cp"
+    else
+	echo "No installation method provided"
+    fi
+}
+
+
+get_asset_with_path() {
+    dupath="$(dirname "${_DUFILE}")"
+    echo "${dupath}/$1"
+}
+
+
+get_asset_from_file() {
+    index="$(printf "%b\n" "$FILE" | sed -n "/$1/=")"
+    [ -z "$index" ] || {
+	tmp_dir="$(mktemp --directory --quiet -t dubi.XXXXXXXXXX)"
+	eval file_content="\$FILE_${index}"
+	# shellcheck disable=SC2154
+	printf "%b\n" "${file_content}" > "${tmp_dir}/$1"
+	echo "${tmp_dir}/$1"
+    }
+}
+
+
+clean_asset_from_file() {
+    [ -f "$1" ] || return
+    case "$1" in
+	*"/dubi."*)
+	    rm -fr "$1" 
+	;;
+    esac
+}
+
+
+get_asset() {
+    asset="$(get_asset_with_path "$1")"
+    [ -f "$asset" ] || asset="$(get_asset_from_file "$1")"
+    [ -f "$asset" ] && echo "$asset"
+}
+
+
+get_device_partition() {
+    case "$1" in
+	"/dev/nvme"* | "/dev/mmc"* | "/dev/loop"*)
+	    echo "$1p${2}"
+	    ;;
+	*)
+	    echo "$1${2}"
+	    ;;
+    esac
+}
+
+
+_dd() {
+    dd "$@" "bs=4k"
+}
+
+
+dd_asset() {
+    asset_name="$(echo "$*" | cut -d" " -f1)"
+    asset="$(get_asset "$asset_name")"
+    [ -z "$asset" ] && die "ERROR: ${asset_name} not found"
+
+    partition="$(get_field "partition" "$*")"
+
+    dd_line="$(echo "$*" | cut -d" " -f2-)"
+    dd_line="$(echo "$dd_line" | sed "s/dst=/seek=/")"
+    dd_line="$(echo "$dd_line" | sed "s/src=/skip=/")"
+    dd_line="$(echo "$dd_line" | sed "s/\s*partition=\w\+//g")"
+
+    if [ -z "$partition" ]; then
+	loopdev="$DEVICE"
+	loopdev_partition="$DEVICE"
+    else
+	loopdev="$(loopdev_attach)"
+	loopdev_partition="$(get_device_partition "$loopdev" "$partition")"
+    fi
+
+    _dd "if=${asset}" "of=${loopdev_partition}" "$dd_line"
+
+    [ -z "$partition" ] || loopdev_detach "$loopdev"
+
+    clean_asset_from_file "$asset"
+}
+
+
+cp_asset() {
+    asset_name="$(echo "$*" | cut -d" " -f1)"
+    asset="$(get_asset "$asset_name")"
+    [ -z "$asset" ] && die "ERROR: ${asset_name} not found"
+
+    partition="$(get_field "partition" "$*")"
+    path="$(get_field "path" "$*")"
+    name="$(get_field "name" "$*")"
+
+    loopdev="$(loopdev_attach)"
+    loopdev_partition="$(get_device_partition "$loopdev" "$partition")"
+    mnt="$(dev_mount "$loopdev_partition")"
+
+    mkdir -p "${mnt}/${path}"
+    cp "$asset" "${mnt}/${path}/${name}"
+
+    dev_umount "$mnt" 
+    loopdev_detach "$loopdev"
+
+    clean_asset_from_file "$asset"
+}
+
+
+dubi_bootloader() {
+    log "Default bootloader installation function"
+    printf '%b\n' "$BOOTLOADER" | while read -r line; do
+	[ -z "$line" ] && continue
+	method="$(get_method_bootloader "$line")"
+	case "$method" in
+	    "dd")
+		dd_asset "$line"
+		;;
+	    "cp")
+		cp_asset "$line"
+		;;
+	    *)
+		echo "Booloader line \"$line\" cannot be installed: $method"
+		;;
+	esac
+    done
+}
+
+
+get_method_devicetree() {
+    if contains "path=" "$1" && contains_any "seek=" "skip=" "dst=" "src=" "$1"; then
+	echo "Impossible to detect installation method"
+    elif contains "path=" "$1" && ! contains "partition=" "$1"; then
+	echo "Missing partition parameter"
+    elif contains "name=" "$1" && ! contains "path=" "$1"; then
+	echo "Missing path parameter"
+    elif contains "seek=" "$1" && contains "dst=" "$1"; then
+	echo "Using dst and seek together, one is an alias of another"
+    elif contains "skip=" "$1" && contains "src=" "$1"; then
+	echo "Using src and skip together, one is an alias of another"
+    elif contains_any "seek=" "skip=" "dst=" "src=" "$1"; then
+	echo "dd"
+    elif contains "path=" "$1"; then
+	echo "cp"
+    else
+	echo "No installation method provided"
+    fi
+}
+
+
+dubi_devicetree() {
+    log "Default devicetree installation function"
+    printf '%b\n' "$DEVICETREE" | while read -r line; do
+	[ -z "$line" ] && continue
+	method="$(get_method_devicetree "$line")"
+	case "$method" in
+	    "dd")
+		dd_asset "$line"
+		;;
+	    "cp")
+		cp_asset "$line"
+		;;
+	    *)
+		echo "Devicetree line \"$line\" cannot be installed: $method"
+		;;
+	esac
+    done
+}
+
+
+get_method_bootscr() {
+    if contains "path=" "$1" && contains_any "seek=" "skip=" "dst=" "src=" "$1"; then
+	echo "Impossible to detect installation method"
+    elif contains "path=" "$1" && ! contains "partition=" "$1"; then
+	echo "Missing partition parameter"
+    elif contains "name=" "$1" && ! contains "path=" "$1"; then
+	echo "Missing path parameter"
+    elif contains "seek=" "$1" && contains "dst=" "$1"; then
+	echo "Using dst and seek together, one is an alias of another"
+    elif contains "skip=" "$1" && contains "src=" "$1"; then
+	echo "Using src and skip together, one is an alias of another"
+    elif contains_any "seek=" "skip=" "dst=" "src=" "$1"; then
+	echo "dd"
+    elif contains "path=" "$1"; then
+	echo "cp"
+    else
+	echo "No installation method provided"
+    fi
+}
+
+
+dubi_bootscr() {
+    log "Default bootscr installation function"
+    printf '%b\n' "$BOOTSCR" | while read -r line; do
+	[ -z "$line" ] && continue
+	method="$(get_method_bootscr "$line")"
+	case "$method" in
+	    "dd")
+		dd_asset "$line"
+		;;
+	    "cp")
+		cp_asset "$line"
+		;;
+	    *)
+		echo "Bootscr line \"$line\" cannot be installed: $method"
+		;;
+	esac
+    done
+}
+
+
+install() {
+    [ "$BACKUP" -eq 1 ] && {
+	echo "Creating backup for partition table"
+	sfdisk --dump "$DEVICE" > partition.backup
+    }
+
+    if [ "$FORMAT" -eq 0 ] && ! is_partitioned; then
+	# TODO: Do make sense to provide a --force to skip this check?
+	die "Device ${DEVICE} has not partition label, use --format to provide a default one"
+    fi
+    if [ "$FORMAT" -eq 1 ] && is_partitioned && [ "$WIPE" -eq 0 ]; then
+	die "Device ${DEVICE} is already partitioned, use --wipe to force the format"
+    fi
+    [ "$FORMAT" -eq 1 ] && partition && format
+
+    bootloader
+    devicetree
+    bootscr
+}
+
+
+# -- MAIN code
+
+trap 'bye; trap - EXIT; exit' EXIT INT HUP
+
+
+bye() {
+    rm -fr "${TMPDIR:-/tmp}"/dubi.* 2> /dev/null || :
+}
+
+
+# Set default values for installation model
+defaults
+
+ARGS=$(getopt -o "hlm:fbwd" \
+	      --long "help,list,model:,backup,format,wipe,dupath:,dufile:" \
+	      -n "$(basename "$0")" -u -- "$@") || usage ""
+# shellcheck disable=SC2086
+set -- $ARGS
+
+while :; do
+    case "$1" in
+	-h|--help)
+	    usage "long"
+	    ;;
+	-l|--list)
+	    list_models
+	    exit 0
+	    ;;
+	-m|--model)
+	    shift
+	    MODEL="$1"
+	    ;;
+	-f|--format)
+	    FORMAT=1
+	    ;;
+	-b|--backup)
+	    BACKUP=1
+	    ;;
+	-w|--wipe)
+	    WIPE=1
+	    ;;
+	--dupath)
+	    shift
+	    DUPATH="$1"
+	    ;;
+	--dufile)
+	    shift
+	    DUFILE="$1"
+	    ;;
+	-d|--debug)
+	    DEBUG=1
+	    ;;
+	--)
+	    break
+	    ;;
+    esac
+    shift
+done
+shift
+
+[ -z "${1-}" ] && {
+    echo "Device parameter DEV missing from the command line"
+    usage ""
+}
+DEVICE="$1"
+[ -e "$DEVICE" ] || die "Device $DEVICE not present in the system"
+
+if [ -z "${MODEL-}" ]; then
+    _DUFILE="${DUPATH}/${DUFILE}"
+else
+    _DUFILE="${DUPATH}/${MODEL}/${DUFILE}"
+fi
+
+[ -f "${_DUFILE}" ] || {
+    echo "dubi file not found (${_DUFILE})"
+    exit 1
+}
+
+# shellcheck disable=SC1090
+. "${_DUFILE}"
+
+init
+
+# Delay the check, so we can validate all the input
+[ "$(id -u)" -ne "0" ] && die "Please, run the installer as a root"
+
+check_requirements
+
+install

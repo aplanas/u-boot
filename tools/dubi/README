@@ -1,0 +1,258 @@
+Das U-Boot Installer
+====================
+
+Dubi (Das U-Boot Installer) is an extensible script that will help to
+install U-Boot for different kind of boards and architectures.
+
+Provided a definition file together with the boot loader for this
+board and all the required assets, the user can install in a SD card
+the boot loader in the proper place.
+
+Multiple of those configuration files and binary assets can be
+available at the same time, so the user can make different
+installations for different hardware.
+
+
+Configuring Dubi
+----------------
+
+The user can provide with a configuration file, that will be searched
+in /usr/etc, /etc and ~/.config, with the name "dubi.cfg".  In there
+we can declare several variables:
+
+- DUPATH: Directory where the different board models assets and
+  configuration files are stored.  Default: "/usr/share/u-boot"
+
+- DUFILE: Name of the configuration file for each board.  This file is
+  expected to be in $DUPATH/$MODEL.  Default: "dubi.dsc"
+
+
+Command line
+------------
+
+In `DUPATH` we can store a set of description files for different
+boards, together with the assets (booloader, boot.scr or device trees)
+required during the installation.  For each board or model we can
+create a subdirectory inside `DUPATH` with the name of the model, and
+collect in-there the description file and the assets for the board.
+
+  -l, --list
+
+    We will get the list of installed models inside `DUPATH`.  For
+    each model will show the basic information, like the CPU type or a
+    short description.  If there is a single model, the program will
+    try to find a description file on the root directory of `DUPATH`.
+
+  -m, --model MODEL
+
+    Will install the specified model inside the device `DEV`.  This
+    can be a normal device or a loop file.
+
+  -f, --format
+
+    Will partition and format the device `DEV` using `sfdisk`.  The
+    description file can indicate how will be the partition layout, or
+    the script can decide the best one by default.
+
+    If the device has already a partition table, it will not force the
+    format, use `--wipe` to drop the partition table and redo the
+    partition and formatting of the device.
+
+  -b, --backup
+
+    Will do a `dump` of the partition table, and store it in
+    `partition.backup`.
+
+  -w, --wipe
+
+    If the device has already a partition table, we need to pass this
+    parameter to remove it and continue with partitioning and
+    formatting of the device.
+
+  --dupath DIR
+
+    Directory where the models descriptions are stored.  Default
+    "/usr/share/u-boot".
+
+  --dufile FILE
+
+    Default name for description files.  Default "dubi.dsc".
+
+  -d --debug
+
+    Shows some debug information during the execution.
+
+  DEV
+
+    Device to install the model.  Can be a normal device like
+    `/dev/mmblk0`, or a local file like `sdcard.img`.
+
+
+Description file
+----------------
+
+The description file for a model contains all the information required
+during the installation.  The default name is `dubi.dsc` an can
+contain variables, calling to `register` function and POSIX Shell code
+to change the default behavior of different stages of the installer.
+
+The description file can declare the value of some variables, that are
+used during the listing of the different models, and during the
+installation process.
+
+  NAME
+
+    String with the model name.  Will appear during the listing of the
+    models.
+
+  CPU
+
+    String with the CPU name of the model.  Will appear during the
+    listing of the models.
+
+  DESCRIPTION
+
+    String with a short description.  Will appear during the listing
+    of the models.
+
+  EFI
+
+    If is a true value (`yes`, `true`, `y`, `t` or `1`) if will assume
+    that the model requires an EFI firmware.  This will affect the
+    default partition layout.  The default value is false.
+
+  LABEL
+
+    Partition label applied during the user defined partition
+    layout. Can be "dos" or "gpt".  Default "dos".
+
+  FILESYSTEM
+
+    Default file system applied during the device format.  Default
+    "ext4".
+
+
+The installer also provides the `register` function, that can be used
+to describe how will be the partitioning and how is expected to be the
+installation for the different assets.
+
+  register partition
+
+    Describe a partition line, and support several parameters (mostly
+    derived directly from the `sfdisk` tool).
+
+    Parameters that expect SIZE should be composed by a number and a
+    multiplicative suffix (K, M, G, T, P, E, Z or Y, upper or lower
+    case and with or without IEC iB suffix like MiB)
+
+      start=SIZE
+
+         Initial gap for the partition. Default "1MiB" (for the
+         initial partition).
+
+      size=SIZE
+
+         Partition size. The last one can avoid this parameter to
+         reference the rest of the free space.
+
+      bootable
+
+         Mark the partition as bootable.
+
+      attrs=VALUE
+
+         GPT partition attributes.
+
+      uuid=VALUE
+
+         GPT partition UUID.
+
+      name=VALUE
+
+         GPT partition name.
+
+      type=VALUE
+
+         Partition type (hexadecimal without 0x for DOS, or short code
+         for GPT).  Possible values for GPT are "linux", "swap",
+         "extended", "home", "uefi", "raid" or "lvm".
+
+      filesystem=VALUE
+
+         File system applied to the partition.
+
+
+  register bootloader
+
+    Describe a bootloader line.  Each line will have a file name
+    parameter for the bootloader file (for example "uboot.bin") and a
+    set of parameters that will describe how will be installed in the
+    SD card.
+
+    seek=SIZE / dst=SIZE
+
+      Position where to store the bootloader inside the SD card (or
+      partition, if the parameter is set)
+
+    skip=SIZE / src=SIZE
+
+      Position from the bootloader to start reading the contents.
+
+    path=VALUE
+
+      Path (optionally including the target name) where to copy the
+      bootloader.  If `path` is present, we need to indicate also the
+      `partition` number.
+
+    name=VALUE
+
+      Name of the target file if `path` has been set.  Useful to
+      rename the file.
+
+    partition=VALUE
+
+      Partition number to store the bootloader.  If `path` is set, the
+      bootloader will be copied to a path inside this partition.  If
+      is not set will be used as a device where to do the dump.
+
+
+  register devicetree
+
+    Describe a devicetree line.  As today accept the same parameters
+    that the bootloader configuration line, except that the first
+    parameter will be the devicetree (DTB) file.
+
+
+  register bootscr
+
+    Describe a bootscr line.  As today accept the same parameters that
+    the bootloader configuration line, except that the first parameter
+    will be the devicetree (DTB) file.
+
+
+  register file
+
+    Used to register file contents that are not in the model
+    directory.  Can be used, for example, to create dynamic boot.scr
+    file contents.  When a register line requires a file asset, it
+    will try to search it in the model directory, and if is not
+    present there it will search in the file registration list.
+
+    The first parameter will be the name of the file, and the second a
+    quoted string to get the contents.  Variables in-there will be
+    interpolated.
+
+
+The `dubi` installer split the installation process in different
+stages: `init`, `partition`, `format`, `bootloader`, `devicetree` and
+`bootscr`.  The user can implement their own behavior inside the
+description file if it provides a function under those names inside
+the description file.
+
+The function `init` will be called after loading the script.  This
+includes when we are loading the description file in order to show the
+model information via the `--list` command.  This can be used to
+calculate the model variables dynamically.
+
+The functions `partition` and `format` will only be called if the user
+instruct to.
